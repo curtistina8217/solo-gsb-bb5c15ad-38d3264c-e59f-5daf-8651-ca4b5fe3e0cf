@@ -1,6 +1,7 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+import math
 from datetime import date, time
 from typing import Optional
 
@@ -325,3 +326,157 @@ class IrrigationPlanResult(BaseModel):
     capacity_violations: list[CapacityViolation]
     day_results: list[IrrigationDayResult]
     batches: list[IrrigationBatch]
+
+
+# --------------------------------------------------------------------------- #
+# Concentrate consumption forecast
+# --------------------------------------------------------------------------- #
+class StockInput(BaseModel):
+    """Current on-hand volume (mL) of one concentrate bottle."""
+
+    name: str = Field(..., min_length=1, description="配方求解结果中的浓缩液名")
+    volume_ml: float = Field(
+        ..., description="当前库存 (mL)，必须为有限非负数；0 表示空瓶"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("volume_ml", mode="before")
+    @classmethod
+    def _non_negative_finite(cls, v) -> float:
+        # mode="before" so strings like "nan"/"inf" are caught here rather
+        # than being coerced to float NaN/inf by Pydantic first.
+        try:
+            f = float(v)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("库存必须是数字 (mL)") from exc
+        if not math.isfinite(f):
+            raise ValueError("库存不能为 NaN 或无穷大")
+        if f < 0:
+            raise ValueError("库存不能为负")
+        return f
+
+
+class ConsumptionForecastRequest(BaseModel):
+    """Body for POST .../versions/{v}/consumption-forecast.
+
+    ``plan`` is a full irrigation-plan request (same validation rules as
+    ``/api/irrigation/plan``); ``stocks`` gives the current volume of every
+    concentrate named in the version's solve result.
+    """
+
+    plan: IrrigationPlanRequest
+    stocks: list[StockInput] = Field(
+        ..., min_length=1, description="各浓缩液当前库存（至少 1 项）"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("stocks")
+    @classmethod
+    def _unique_stock_names(cls, v: list[StockInput]) -> list[StockInput]:
+        names = [s.name for s in v]
+        if len(names) != len(set(names)):
+            raise ValueError("浓缩液库存条目名称不能重复")
+        return v
+
+
+class ForecastDosage(BaseModel):
+    """Per-mL mix ratio of one concentrate in this recipe version."""
+
+    concentrate: str
+    allocation_ml: float = Field(
+        ..., description="该版本求解结果中每批次目标体积下的标准用量 (mL)"
+    )
+    mix_total_ml: float = Field(..., description="求解时的工作液目标总体积 (mL)")
+    ratio: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="配比 = allocation_ml / mix_total_ml，浓缩液 mL / 工作液 mL",
+    )
+    ml_per_liter_water: float = Field(
+        ..., description="每 1 L 灌溉水需要的浓缩液 (mL) = 1000 * ratio"
+    )
+
+
+class ForecastBatchShortage(BaseModel):
+    concentrate: str
+    required_ml: float
+    served_ml: float
+    shortfall_ml: float
+
+
+class ForecastBatch(BaseModel):
+    """One actual (post-merge) irrigation batch and its draw on stocks."""
+
+    date: str = Field(..., description="批次本地开始时间所在的本地日历日")
+    start_utc: str
+    local_start: str
+    local_end: str
+    water_ml: float
+    merged: bool
+    batch_count_before_merge: int
+    crosses_midnight: bool
+    required_ml: dict[str, float] = Field(
+        ..., description="本批次完整预测所需各浓缩液 (mL)，库存不足也不削减"
+    )
+    served_ml: dict[str, float] = Field(
+        ..., description="本批次实际可从库存支取的各浓缩液 (mL)"
+    )
+    shortfall_ml: dict[str, float] = Field(
+        ..., description="本批次各浓缩液缺口 (mL)，无缺口为 0"
+    )
+    end_stock_ml: dict[str, float] = Field(
+        ...,
+        description="本批次结束后各浓缩液剩余库存 (mL)，恒非负",
+    )
+    stock_sufficient: bool
+    shortages: list[ForecastBatchShortage]
+
+
+class ForecastDay(BaseModel):
+    """All batches whose local start falls on one local calendar day."""
+
+    date: str
+    batch_count: int = Field(..., description="当日实际（合并后）批次数")
+    water_ml: float = Field(..., description="当日实际批次水量合计 (mL)")
+    required_ml: dict[str, float]
+    served_ml: dict[str, float]
+    shortfall_ml: dict[str, float]
+    end_stock_ml: dict[str, float] = Field(
+        ..., description="当日最后一个批次结束后的剩余库存 (mL)，恒非负"
+    )
+    stock_sufficient: bool = Field(
+        ..., description="当日所有批次是否全部足额支取"
+    )
+
+
+class ConsumptionForecastResult(BaseModel):
+    recipe_id: int
+    version: int
+    recipe_feasible: bool = Field(
+        ...,
+        description=(
+            "该版本求解结果是否在容差内可行；不可行版本（force 保存）"
+            "的配比仅为最优折中，预测照算但会显式标注"
+        ),
+    )
+    recipe_message: str
+    timezone: str
+    start_date: str
+    end_date: str
+    mix_total_ml: float = Field(..., description="配方版本的工作液目标总体积 (mL)")
+    dosage: list[ForecastDosage]
+    initial_stock_ml: dict[str, float]
+    total_water_ml: float
+    total_required_ml: dict[str, float]
+    total_served_ml: dict[str, float]
+    total_shortfall_ml: dict[str, float]
+    final_stock_ml: dict[str, float] = Field(..., description="全部批次结束后的剩余库存")
+    stock_sufficient: bool = Field(..., description="整个计划内是否从未出现缺口")
+    first_shortage_date: Optional[str] = Field(
+        None, description="首次出现任一浓缩液不足的本地日期；全程充足为 null"
+    )
+    day_results: list[ForecastDay]
+    batches: list[ForecastBatch]

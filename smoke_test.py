@@ -427,4 +427,219 @@ with TestClient(app) as client:
     assert r.status_code == 422
     print("21) all invalid irrigation inputs rejected with 422")
 
+    # =================================================================== #
+    # Consumption forecast
+    # POST /api/recipes/{id}/versions/{v}/consumption-forecast
+    # =================================================================== #
+    rid = v1["recipe_id"]
+    fc_url = f"/api/recipes/{rid}/versions/1/consumption-forecast"
+
+    def fc_body(**overrides) -> dict:
+        body = {
+            "plan": {
+                "timezone": "Asia/Shanghai",
+                "start_date": "2026-05-01",
+                "end_date": "2026-05-02",
+                # 08:00(500) + 08:10:30(200), gap 30s -> merged 700 mL batch
+                "sessions": [
+                    {"start_time": "08:00", "duration_minutes": 10,
+                     "water_ml": 500},
+                    {"start_time": "08:10:30", "duration_minutes": 5,
+                     "water_ml": 200},
+                ],
+                "daily_capacity_ml": 10000,
+            },
+            # recipe v1: per 10000 mL -> A 1500 (ratio .15), B 125 (.0125)
+            "stocks": [
+                {"name": "A液", "volume_ml": 1000},
+                {"name": "B液", "volume_ml": 1000},
+            ],
+        }
+        body.update(overrides)
+        return body
+
+    # 22) proportional draw on merged batches, per-day aggregation -------- #
+    r = client.post(fc_url, json=fc_body())
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["recipe_feasible"] is True
+    assert d["mix_total_ml"] == 10000
+    dosage = {x["concentrate"]: x for x in d["dosage"]}
+    assert dosage["A液"]["ratio"] == 0.15
+    assert dosage["B液"]["ml_per_liter_water"] == 12.5
+    # two merged 700 mL batches, one per local day
+    assert len(d["batches"]) == 2
+    assert all(b["water_ml"] == 700 and b["merged"] for b in d["batches"])
+    b0 = d["batches"][0]
+    assert b0["date"] == "2026-05-01"
+    assert b0["required_ml"] == {"A液": 105.0, "B液": 8.75}
+    assert b0["served_ml"] == {"A液": 105.0, "B液": 8.75}
+    assert b0["shortfall_ml"] == {"A液": 0.0, "B液": 0.0}
+    assert b0["stock_sufficient"] and b0["shortages"] == []
+    assert d["total_water_ml"] == 1400.0
+    assert d["total_required_ml"] == {"A液": 210.0, "B液": 17.5}
+    assert d["final_stock_ml"] == {"A液": 790.0, "B液": 982.5}
+    assert d["stock_sufficient"] is True
+    assert d["first_shortage_date"] is None
+    days = {x["date"]: x for x in d["day_results"]}
+    assert set(days) == {"2026-05-01", "2026-05-02"}
+    assert days["2026-05-01"]["batch_count"] == 1
+    assert days["2026-05-01"]["water_ml"] == 700
+    assert days["2026-05-01"]["end_stock_ml"] == {"A液": 895.0, "B液": 991.25}
+    assert days["2026-05-02"]["end_stock_ml"] == {"A液": 790.0, "B液": 982.5}
+    print("22) forecast proportional draw + per-day rollup ok")
+
+    # 23) shortage: forecast stays complete, batch flagged, no negatives -- #
+    short = fc_body(stocks=[
+        {"name": "A液", "volume_ml": 150},
+        {"name": "B液", "volume_ml": 1000},
+    ])
+    d = client.post(fc_url, json=short).json()
+    assert d["stock_sufficient"] is False
+    assert d["first_shortage_date"] == "2026-05-02"
+    b1 = d["batches"][1]
+    assert b1["stock_sufficient"] is False
+    # full predicted demand kept
+    assert b1["required_ml"]["A液"] == 105.0
+    assert b1["served_ml"]["A液"] == 45.0
+    assert b1["shortfall_ml"]["A液"] == 60.0
+    assert b1["end_stock_ml"]["A液"] == 0.0
+    assert len(b1["shortages"]) == 1
+    assert b1["shortages"][0] == {
+        "concentrate": "A液", "required_ml": 105.0,
+        "served_ml": 45.0, "shortfall_ml": 60.0}
+    assert d["total_required_ml"]["A液"] == 210.0
+    assert d["total_served_ml"]["A液"] == 150.0
+    assert d["total_shortfall_ml"]["A液"] == 60.0
+    assert d["final_stock_ml"]["A液"] == 0.0
+    # later batches keep the full demand and never go negative
+    for b in d["batches"]:
+        assert all(v >= 0 for v in b["end_stock_ml"].values())
+        assert all(v >= 0 for v in b["served_ml"].values())
+        assert all(v >= 0 for v in b["shortfall_ml"].values())
+    assert d["day_results"][0]["stock_sufficient"] is True
+    assert d["day_results"][1]["stock_sufficient"] is False
+    assert d["day_results"][1]["shortfall_ml"]["A液"] == 60.0
+    print("23) shortage flagged with full forecast, no negative stock")
+
+    # 24) cross-midnight / merged batches charged exactly once ------------ #
+    once = {
+        "plan": {
+            "timezone": "UTC",
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-02",
+            # 23:59(100) merges across midnight with next day 00:00(50)
+            "sessions": [
+                {"start_time": "23:59", "duration_minutes": 1,
+                 "water_ml": 100},
+                {"start_time": "00:00:30", "duration_minutes": 1,
+                 "water_ml": 50},
+            ],
+            "daily_capacity_ml": 10000,
+        },
+        "stocks": [
+            {"name": "A液", "volume_ml": 1000},
+            {"name": "B液", "volume_ml": 1000},
+        ],
+    }
+    d = client.post(fc_url, json=once).json()
+    # merged cross-midnight batch (150 mL) + the two standalone same-day
+    # batches = 3 actual batches; merged one attributed to its start day
+    assert len(d["batches"]) == 3
+    merged = [b for b in d["batches"] if b["merged"]]
+    assert len(merged) == 1
+    m = merged[0]
+    assert m["date"] == "2024-01-01"
+    assert m["crosses_midnight"] is True
+    assert m["water_ml"] == 150
+    assert m["required_ml"]["A液"] == 22.5   # 150 * .15, counted once
+    # totals: raw water = 2 days * 150 = 300, no double counting
+    assert d["total_water_ml"] == 300.0
+    assert d["total_required_ml"]["A液"] == 45.0
+    assert d["total_required_ml"]["B液"] == 3.75
+    daymap = {x["date"]: x for x in d["day_results"]}
+    assert daymap["2024-01-01"]["batch_count"] == 2
+    # day 1: merged 150 mL batch (starts 01-01 23:59) + standalone
+    # 00:00:30 50 mL batch = 200; day 2: standalone 23:59 100 mL
+    assert daymap["2024-01-01"]["water_ml"] == 200
+    assert daymap["2024-01-02"]["water_ml"] == 100
+    print("24) cross-midnight merged batch counted once on start day")
+
+    # 25) zero stock allowed -> every batch short, first day flagged ------ #
+    zero = fc_body(stocks=[
+        {"name": "A液", "volume_ml": 0},
+        {"name": "B液", "volume_ml": 0},
+    ])
+    d = client.post(fc_url, json=zero).json()
+    assert d["first_shortage_date"] == "2026-05-01"
+    assert d["total_served_ml"] == {"A液": 0.0, "B液": 0.0}
+    assert d["total_required_ml"] == {"A液": 210.0, "B液": 17.5}
+    assert d["final_stock_ml"] == {"A液": 0.0, "B液": 0.0}
+    print("25) zero stock: full demand preserved, nothing served")
+
+    # 26) error responses ------------------------------------------------- #
+    def fc_4xx(body, url=fc_url, code=422):
+        r = client.post(url, json=body)
+        assert r.status_code == code, (r.status_code, r.text[:300])
+
+    fc_4xx(fc_body(), url=f"/api/recipes/999/versions/1/consumption-forecast",
+           code=404)
+    fc_4xx(fc_body(),
+           url=f"/api/recipes/{rid}/versions/99/consumption-forecast",
+           code=404)
+    # unknown concentrate
+    bad = fc_body(stocks=[
+        {"name": "A液", "volume_ml": 1},
+        {"name": "B液", "volume_ml": 1},
+        {"name": "C液", "volume_ml": 1}])
+    r = client.post(fc_url, json=bad)
+    assert r.status_code == 422 and "未知" in r.json()["detail"]["message"]
+    # missing concentrate
+    bad = fc_body(stocks=[{"name": "A液", "volume_ml": 1}])
+    r = client.post(fc_url, json=bad)
+    assert r.status_code == 422 and "缺少" in r.json()["detail"]["message"]
+    # negative / NaN stock
+    fc_4xx(fc_body(stocks=[
+        {"name": "A液", "volume_ml": -0.1}, {"name": "B液", "volume_ml": 1}]))
+    bad = fc_body(stocks=[
+        {"name": "A液", "volume_ml": "nan"},
+        {"name": "B液", "volume_ml": 1}])
+    fc_4xx(bad)
+    # duplicate stock entries
+    fc_4xx(fc_body(stocks=[
+        {"name": "A液", "volume_ml": 1}, {"name": "A液", "volume_ml": 2},
+        {"name": "B液", "volume_ml": 1}]))
+    # empty stocks
+    fc_4xx(fc_body(stocks=[]))
+    # plan validation failures surface as 422
+    bad_plan = fc_body()
+    bad_plan["plan"]["timezone"] = "Mars/Olympus"
+    fc_4xx(bad_plan)
+    bad_plan = fc_body()
+    bad_plan["plan"]["end_date"] = "2026-04-30"
+    fc_4xx(bad_plan)
+    bad_plan = fc_body()
+    bad_plan["plan"]["sessions"][0]["water_ml"] = -5
+    fc_4xx(bad_plan)
+    # extra/unknown field
+    bad = fc_body()
+    bad["bogus"] = 1
+    fc_4xx(bad)
+    print("26) forecast 404/422 error responses ok")
+
+    # 27) force-saved infeasible version still forecasts, flagged --------- #
+    r = client.post("/api/recipes?force=true", json={
+        "name": "bad-fc", "request": bad4})
+    assert r.status_code == 201
+    vbad = r.json()
+    d = client.post(
+        f"/api/recipes/{vbad['recipe_id']}/versions/1/consumption-forecast",
+        json=fc_body(stocks=[
+            {"name": "A液", "volume_ml": 1e9},
+            {"name": "B液", "volume_ml": 1e9}]),
+    ).json()
+    assert d["recipe_feasible"] is False
+    assert "无可行解" in d["recipe_message"]
+    print("27) infeasible version forecast flagged via recipe_feasible=false")
+
 print("\nALL SMOKE TESTS PASSED")

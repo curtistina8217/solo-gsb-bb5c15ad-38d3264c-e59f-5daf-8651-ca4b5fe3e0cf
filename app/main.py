@@ -10,8 +10,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database
+from .forecast import build_forecast
 from .irrigation import build_plan
 from .models import (
+    ConsumptionForecastRequest,
+    ConsumptionForecastResult,
     IrrigationPlanRequest,
     IrrigationPlanResult,
     RecipeSummary,
@@ -206,3 +209,88 @@ def export_version(recipe_id: int, version: int) -> JSONResponse:
             "Content-Type": "application/json; charset=utf-8",
         },
     )
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/consumption-forecast",
+    response_model=ConsumptionForecastResult,
+    tags=["recipes"],
+    summary="按灌溉计划预测各浓缩液逐日消耗与库存耗尽日期",
+)
+def consumption_forecast(
+    recipe_id: int, version: int, req: ConsumptionForecastRequest
+) -> ConsumptionForecastResult:
+    """读取指定配方版本的求解结果，按实际灌溉批次等比例扣减浓缩液库存。
+
+    - 配比取自该版本结果 ``allocations[i].volume_ml / total_volume_ml``；
+      每个实际批次（**已合并跨午夜/相邻批次**，故同一批次只扣一次）按其
+      水量等比例消耗各浓缩液。
+    - 批次按**本地开始时间所在日**归集，输出每日所需/实取/缺口及日末库存。
+    - 库存按批次累计扣减；任一浓缩液不足时**预测保持完整**
+      （``required_ml`` 不削减），该批次以 ``shortages`` /
+      ``shortfall_ml`` 标记缺口，库存夹零、**绝不为负**，并给出
+      ``first_shortage_date``。
+    - 配方/版本不存在返回 404；未知液体、缺少液体、负库存（含 NaN/无穷大）、
+      灌溉计划参数非法均返回 422。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    payload = database.serialize_version(row)
+    result = payload["result"]
+    known = {str(a["concentrate"]) for a in result["allocations"]}
+    provided = {s.name for s in req.stocks}
+
+    unknown = sorted(provided - known)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "库存中存在该配方版本未知的浓缩液："
+                    f"{ '、'.join(unknown) }；该版本包含："
+                    f"{ '、'.join(sorted(known)) }。"
+                ),
+                "unknown_concentrates": unknown,
+            },
+        )
+    missing = sorted(known - provided)
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "缺少以下浓缩液的当前库存（必须逐瓶提供，"
+                    "空瓶请填 0）：" + "、".join(missing)
+                ),
+                "missing_concentrates": missing,
+            },
+        )
+
+    plan_req = req.plan
+    tz = ZoneInfo(plan_req.timezone)
+    sessions = [
+        (s.start_time, s.start_time.strftime("%H:%M:%S"),
+         s.duration_minutes, s.water_ml)
+        for s in plan_req.sessions
+    ]
+    plan = build_plan(
+        tz=tz,
+        start_date=plan_req.start_date,
+        end_date=plan_req.end_date,
+        sessions=sessions,
+        daily_capacity_ml=plan_req.daily_capacity_ml,
+    )
+
+    forecast = build_forecast(
+        recipe_id=recipe_id,
+        version=version,
+        version_payload=payload,
+        stocks={s.name: s.volume_ml for s in req.stocks},
+        plan=plan,
+    )
+    return ConsumptionForecastResult(**forecast)

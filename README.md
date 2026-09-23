@@ -50,6 +50,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions` | 某配方的全部版本 |
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
+| POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批扣减浓缩液，输出逐日消耗、剩余库存与首次不足日期 |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验） |
 | GET | `/health` | 健康检查 |
 
@@ -317,14 +318,157 @@ curl -s http://localhost:8000/api/irrigation/plan \
 
 以下情况一律返回 **422**：非法时区（`Mars/Olympus`、`+08:00`、空串）、日期顺序颠倒或超过 370 天、时间格式非法（`25:00`）、`sessions` 为空或开始时间重复、持续分钟数/水量非正、容量为负、多余字段。
 
+## 浓缩液库存消耗预测（POST /api/recipes/{id}/versions/{v}/consumption-forecast）
+
+在某个**已保存的配方版本**上，给出未来一段灌溉排程下各浓缩液的库存消耗预测。服务先读取该版本求解结果中的配比，再把灌溉计划展开为**实际执行批次**（与 `/api/irrigation/plan` 同一引擎，已处理 DST、跨午夜与相邻批次合并），然后：
+
+- **等比例扣减**：每批次所需浓缩液 `i` = `批次水量 × allocation_i / 目标配方总体积`。合并批次按合并后总水量只扣一次，跨午夜的单个会话也只扣一次。
+- **按本地日归集**：批次计入其**本地开始时间所在的日历日**（合并跨午夜的批次整体计入开始日，绝不拆分或重复计）。输出每日所需 / 实取 / 缺口 / 日末库存。
+- **库存不足也保留完整预测**：库存按批次累计扣减；某瓶不够时，该批次仍给出完整的 `required_ml`，同时用 `served_ml` / `shortfall_ml` 与 `shortages` 标记缺口，剩余库存夹在 **0**（绝不为负），并返回 `first_shortage_date`（首次出现任一浓缩液不足的本地日期）。
+
+### 请求
+
+```bash
+curl -s http://localhost:8000/api/recipes/1/versions/1/consumption-forecast \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "plan": {
+      "timezone": "Asia/Shanghai",
+      "start_date": "2026-05-01",
+      "end_date": "2026-05-03",
+      "sessions": [
+        {"start_time": "08:00",    "duration_minutes": 10, "water_ml": 500},
+        {"start_time": "08:10:30", "duration_minutes": 5,  "water_ml": 200},
+        {"start_time": "23:55",    "duration_minutes": 10, "water_ml": 300}
+      ],
+      "daily_capacity_ml": 1100
+    },
+    "stocks": [
+      {"name": "A液", "volume_ml": 2000},
+      {"name": "B液", "volume_ml": 500}
+    ]
+  }'
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `plan` | 完整的灌溉计划参数，字段与校验规则同 [POST /api/irrigation/plan](#灌溉计划post-apirrigationplan)（时区/日期范围/每日时段与水量/日容量） |
+| `stocks[].name` | 浓缩液名，必须与该版本求解结果 `allocations[].concentrate` 完全一致；出现未知液体或缺少某瓶（空瓶也要显式填 `0`）返回 422 |
+| `stocks[].volume_ml` | 当前库存 (mL)，必须为有限非负数；负数、`NaN`、`Infinity` 返回 422 |
+
+> 该配方版本若以 `?force=true` 保存了不可行结果，预测仍按其中的最优折中配比计算，但响应中 `recipe_feasible=false` 以示提醒。
+
+### 响应（节选与说明）
+
+以 10 L 配方（A 液 1500 mL、B 液 125 mL，配比 0.15 / 0.0125）为例，每个 700 mL 的合并批次需要 A 液 105 mL、B 液 8.75 mL：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "recipe_feasible": true,
+  "recipe_message": "求解成功：所有目标元素偏差均在容差范围内。",
+  "timezone": "Asia/Shanghai",
+  "start_date": "2026-05-01",
+  "end_date": "2026-05-03",
+  "mix_total_ml": 10000.0,
+  "dosage": [
+    {"concentrate": "A液", "allocation_ml": 1500.0, "mix_total_ml": 10000.0,
+     "ratio": 0.15, "ml_per_liter_water": 150.0},
+    {"concentrate": "B液", "allocation_ml": 125.0, "mix_total_ml": 10000.0,
+     "ratio": 0.0125, "ml_per_liter_water": 12.5}
+  ],
+  "initial_stock_ml": {"A液": 2000.0, "B液": 500.0},
+  "total_water_ml": 3000.0,
+  "total_required_ml": {"A液": 450.0, "B液": 37.5},
+  "total_served_ml": {"A液": 450.0, "B液": 37.5},
+  "total_shortfall_ml": {"A液": 0.0, "B液": 0.0},
+  "final_stock_ml": {"A液": 1550.0, "B液": 462.5},
+  "stock_sufficient": true,
+  "first_shortage_date": null,
+  "day_results": [
+    {
+      "date": "2026-05-01",
+      "batch_count": 2,
+      "water_ml": 1000.0,
+      "required_ml": {"A液": 150.0, "B液": 12.5},
+      "served_ml": {"A液": 150.0, "B液": 12.5},
+      "shortfall_ml": {"A液": 0.0, "B液": 0.0},
+      "end_stock_ml": {"A液": 1850.0, "B液": 487.5},
+      "stock_sufficient": true
+    }
+  ],
+  "batches": [
+    {
+      "date": "2026-05-01",
+      "start_utc": "2026-05-01T00:00:00Z",
+      "local_start": "2026-05-01T08:00:00+0800",
+      "local_end": "2026-05-01T08:15:30+0800",
+      "water_ml": 700.0,
+      "merged": true,
+      "batch_count_before_merge": 2,
+      "crosses_midnight": false,
+      "required_ml": {"A液": 105.0, "B液": 8.75},
+      "served_ml": {"A液": 105.0, "B液": 8.75},
+      "shortfall_ml": {"A液": 0.0, "B液": 0.0},
+      "end_stock_ml": {"A液": 1895.0, "B液": 491.25},
+      "stock_sufficient": true,
+      "shortages": []
+    }
+  ]
+}
+```
+
+当某瓶在计划开始前只剩 150 mL（恰够第一天），**后续批次的预测不削减**，缺口在批次上显式标出，库存不会出现负数：
+
+```json
+{
+  "stock_sufficient": false,
+  "first_shortage_date": "2026-05-02",
+  "total_required_ml": {"A液": 450.0, "B液": 37.5},
+  "total_served_ml": {"A液": 150.0, "B液": 37.5},
+  "total_shortfall_ml": {"A液": 300.0, "B液": 0.0},
+  "final_stock_ml": {"A液": 0.0, "B液": 462.5}
+}
+```
+
+首个不足批次（05-02 第一个 700 mL 合并批次，A 液已无库存）示例：
+
+```json
+{
+  "date": "2026-05-02",
+  "water_ml": 700.0,
+  "required_ml": {"A液": 105.0, "B液": 8.75},
+  "served_ml": {"A液": 0.0, "B液": 8.75},
+  "shortfall_ml": {"A液": 105.0, "B液": 0.0},
+  "end_stock_ml": {"A液": 0.0, "B液": 478.75},
+  "stock_sufficient": false,
+  "shortages": [
+    {"concentrate": "A液", "required_ml": 105.0,
+     "served_ml": 0.0, "shortfall_ml": 105.0}
+  ]
+}
+```
+
+### 错误响应
+
+| 状态码 | 情形 |
+| ---- | ---- |
+| 404 | `recipe_id` 不存在（`配方不存在`），或该配方下 `version` 不存在（`该版本不存在`） |
+| 422 | 库存中出现该版本**未知液体**（detail 给出未知名称与本版本全部液体名）；**缺少**某瓶液体的库存条目；库存为负 / `NaN` / 无穷大 / 非数字；库存条目重名 |
+| 422 | 灌溉计划校验失败：非法时区、日期顺序颠倒或超 370 天、非法时间、`sessions` 为空或时间重复、水量/时长非正、容量为负、多余字段等（规则同灌溉计划接口） |
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划 / 消耗预测）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
+│   ├── forecast.py   # 浓缩液消耗预测：按实际批次等比例扣减、缺口标记
 │   ├── models.py     # Pydantic 请求/响应模型
 │   ├── database.py   # SQLite 初始化与配方/版本存取
 │   └── config.py     # 元素清单、默认容差、DB 路径
