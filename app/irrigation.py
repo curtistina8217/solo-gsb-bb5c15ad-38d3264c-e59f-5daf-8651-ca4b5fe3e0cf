@@ -128,14 +128,16 @@ def build_plan(
     start_date: date,
     end_date: date,
     sessions: list[tuple[time, str, float, float]],
-    daily_capacity_ml: float,
+    daily_capacity_ml: float | None,
     merge_gap_seconds: int = 60,
 ) -> dict:
     """Build the full irrigation plan structure.
 
     ``sessions`` is a list of ``(local_time, requested_text,
     duration_minutes, water_ml)`` tuples already validated by the
-    Pydantic layer.
+    Pydantic layer.  ``daily_capacity_ml=None`` skips the capacity
+    checks entirely (used by the consumption forecast, which has no
+    device-capacity input).
     """
     tz_key = getattr(tz, "key", None) or str(tz)
     total_days = (end_date - start_date).days + 1
@@ -215,7 +217,10 @@ def build_plan(
         day = start_date + timedelta(days=i)
         planned = day_water[day]
         total_planned += planned
-        over = planned > daily_capacity_ml + 1e-9
+        if daily_capacity_ml is None:
+            over = False
+        else:
+            over = planned > daily_capacity_ml + 1e-9
         shortfall = round(planned - daily_capacity_ml, 6) if over else 0.0
         dst_flags = []
         if day_gap[day]:

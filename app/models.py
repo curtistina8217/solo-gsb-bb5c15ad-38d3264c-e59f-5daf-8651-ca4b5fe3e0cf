@@ -201,7 +201,9 @@ class IrrigationSessionInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class IrrigationPlanRequest(BaseModel):
+class IrrigationScheduleBase(BaseModel):
+    """Common validated daily-schedule fields (planning & forecasting)."""
+
     timezone: str = Field(
         ...,
         min_length=1,
@@ -212,9 +214,6 @@ class IrrigationPlanRequest(BaseModel):
     end_date: date = Field(..., description="结束日期（含，本地日历日）")
     sessions: list[IrrigationSessionInput] = Field(
         ..., min_length=1, description="每日重复的灌溉开始时段（至少 1 个）"
-    )
-    daily_capacity_ml: float = Field(
-        ..., ge=0, description="设备每日供水容量 (mL)，非负；0 表示当日不可供水"
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -249,7 +248,7 @@ class IrrigationPlanRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _validate_range(self) -> "IrrigationPlanRequest":
+    def _validate_range(self) -> "IrrigationScheduleBase":
         if self.end_date < self.start_date:
             raise ValueError(
                 "end_date 不能早于 start_date"
@@ -262,6 +261,12 @@ class IrrigationPlanRequest(BaseModel):
                 f"日期范围最多 {MAX_PLAN_DAYS} 天，当前 {span} 天"
             )
         return self
+
+
+class IrrigationPlanRequest(IrrigationScheduleBase):
+    daily_capacity_ml: float = Field(
+        ..., ge=0, description="设备每日供水容量 (mL)，非负；0 表示当日不可供水"
+    )
 
 
 class PlanSessionRef(BaseModel):
@@ -325,3 +330,120 @@ class IrrigationPlanResult(BaseModel):
     capacity_violations: list[CapacityViolation]
     day_results: list[IrrigationDayResult]
     batches: list[IrrigationBatch]
+
+
+# --------------------------------------------------------------------------- #
+# Concentrate consumption forecast
+# --------------------------------------------------------------------------- #
+class StockLevel(BaseModel):
+    """Current on-hand volume of one concentrate (mL)."""
+
+    concentrate: str = Field(
+        ..., min_length=1, description="配方版本求解结果中的浓缩液名称"
+    )
+    stock_ml: float = Field(..., ge=0, description="当前库存 (mL)，不能为负")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ConsumptionForecastRequest(IrrigationScheduleBase):
+    """Irrigation schedule + current stock levels for one recipe version."""
+
+    stock: list[StockLevel] = Field(
+        ..., min_length=1, description="各浓缩液当前库存；名称须与配方求解结果一致"
+    )
+
+    @field_validator("stock")
+    @classmethod
+    def _unique_stock(cls, v: list[StockLevel]) -> list[StockLevel]:
+        names = [s.concentrate for s in v]
+        if len(names) != len(set(names)):
+            raise ValueError("库存浓缩液名称不能重复")
+        return v
+
+
+class ForecastLiquidUse(BaseModel):
+    """Per-concentrate usage / gap in one batch, or on one day."""
+
+    concentrate: str
+    required_ml: float = Field(..., description="按比例应消耗 (mL)")
+    consumed_ml: float = Field(
+        ..., description="实际扣减 (mL)；库存不足时仅扣到 0，不会出现负库存"
+    )
+    shortfall_ml: float = Field(..., description="本批缺口 = 应消耗 - 实际扣减")
+
+
+class ForecastBatch(BaseModel):
+    """One actual (post-merge) irrigation batch with concentrate draw-down."""
+
+    index: int = Field(..., description="按执行顺序（UTC 开始时间）的批次序号，从 1 起")
+    start_utc: str
+    local_start: str
+    local_end: str
+    attributed_date: str = Field(
+        ...,
+        description=(
+            "归属本地日：取批次本地开始日；跨午夜/合并批次整体只计入这一天，"
+            "不重复扣减"
+        ),
+    )
+    water_ml: float
+    merged: bool
+    batch_count_before_merge: int
+    crosses_midnight: bool
+    sufficient: bool = Field(..., description="本批所有浓缩液库存是否都够")
+    liquids: list[ForecastLiquidUse]
+
+
+class ForecastDayLiquid(BaseModel):
+    concentrate: str
+    required_ml: float
+    consumed_ml: float
+    shortfall_ml: float
+    remaining_ml: float = Field(..., description="当日结束后的剩余库存（≥ 0）")
+
+
+class ForecastDay(BaseModel):
+    date: str
+    batches: int = Field(..., description="归属本日的实际（合并后）批次数")
+    water_ml: float
+    sufficient: bool
+    liquids: list[ForecastDayLiquid]
+
+
+class ForecastLiquidSummary(BaseModel):
+    concentrate: str
+    initial_stock_ml: float
+    mix_ml_per_l: float = Field(
+        ..., description="每升灌溉水需该浓缩液 mL（配方分配体积 / 目标体积）"
+    )
+    total_required_ml: float
+    total_consumed_ml: float
+    total_shortfall_ml: float
+    remaining_ml: float
+    first_shortfall_date: Optional[str] = None
+
+
+class ConsumptionForecastResult(BaseModel):
+    recipe_id: int
+    version: int
+    recipe_feasible: bool = Field(
+        ..., description="对应配方版本求解结果是否在容差内可行"
+    )
+    warning: Optional[str] = Field(
+        None, description="配方版本不可行时的提示；可行时为 null"
+    )
+    timezone: str
+    start_date: str
+    end_date: str
+    days: int
+    batch_count_before_merge: int
+    batch_count_after_merge: int
+    planned_water_ml: float
+    sufficient: bool = Field(..., description="整个计划周期内库存是否始终充足")
+    first_shortfall_date: Optional[str] = Field(
+        None, description="首个出现任一浓缩液缺口的本地日期；全程充足为 null"
+    )
+    liquids: list[ForecastLiquidSummary]
+    day_results: list[ForecastDay]
+    batches: list[ForecastBatch]

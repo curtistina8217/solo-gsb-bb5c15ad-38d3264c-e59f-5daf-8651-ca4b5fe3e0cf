@@ -10,8 +10,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database
+from .forecast import ForecastError, build_forecast
 from .irrigation import build_plan
 from .models import (
+    ConsumptionForecastRequest,
+    ConsumptionForecastResult,
     IrrigationPlanRequest,
     IrrigationPlanResult,
     RecipeSummary,
@@ -170,6 +173,55 @@ def get_version(recipe_id: int, version: int) -> RecipeVersion:
     if row is None:
         raise HTTPException(404, "该版本不存在")
     return RecipeVersion(**database.serialize_version(row))
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/consumption-forecast",
+    response_model=ConsumptionForecastResult,
+    tags=["recipes"],
+    summary="按灌溉计划预测浓缩液消耗与库存耗尽日期",
+)
+def consumption_forecast(
+    recipe_id: int, version: int, req: ConsumptionForecastRequest
+) -> ConsumptionForecastResult:
+    """读取指定配方版本的求解结果，按实际灌溉批次等比例扣减浓缩液。
+
+    - 配方中每升灌溉水需要的各浓缩液体积（``allocations /
+      total_volume_ml``）乘以每个**合并后实际批次**的水量得到本批需求；
+      跨午夜/合并批次整体只扣一次（归属批次本地开始日）。
+    - 任一浓缩液库存不足时：批次水量与需求保持完整，实际扣减到 0 为止，
+      缺口记入该批次与当日，**绝不出现负库存**，后续批次预测照常进行。
+    - 输出每日消耗/剩余、各液全程汇总以及首个出现缺口的本地日期。
+    - 配方/版本不存在返回 404；库存名称未知、缺少某液、库存为负或计划
+      参数非法返回 422/4xx。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    result_payload = json.loads(row["result_json"])
+    stock = {s.concentrate: s.stock_ml for s in req.stock}
+    try:
+        forecast = build_forecast(
+            recipe_id=recipe_id,
+            version=version,
+            solve_result=result_payload,
+            tz=ZoneInfo(req.timezone),
+            start_date=req.start_date,
+            end_date=req.end_date,
+            sessions=[
+                (s.start_time, s.start_time.strftime("%H:%M:%S"),
+                 s.duration_minutes, s.water_ml)
+                for s in req.sessions
+            ],
+            stock=stock,
+        )
+    except ForecastError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return ConsumptionForecastResult(**forecast)
 
 
 @app.get(
